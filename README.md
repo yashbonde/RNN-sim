@@ -6,9 +6,9 @@ Running large number of simulations before making a decision is the best approac
 
 All notebooks are available in `notebooks/` folder.
 
-* First paper we are implementing is "Finetuning Pretrained Transformers into RNNs" [[arxiv](https://arxiv.org/pdf/2103.13076.pdf)]
+## Finetuning Pretrained Transformers into RNNs [arxiv](https://arxiv.org/pdf/2103.13076.pdf)
 
-These are the results from above paper
+Find code in folder `t2rmodel.py`. Run `$python3 t2rmodel.py` to perform tests as well. These are the results from paper:
 
 <img src="notebooks/raw_time_log.png">
 
