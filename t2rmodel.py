@@ -58,7 +58,7 @@ class RNNAttention(nn.Module):
     out = w @ v # [B,H,S,E//H]
     out = self.merge_heads(out) # [B,S,E]
     out = self.c_proj(out)
-    return out
+    return [out]
 
   # functions to behave like RNN
   def infer_init(self):
@@ -116,21 +116,25 @@ class RNNAttention(nn.Module):
     s = self.merge_heads(s) # [B,k,E]
     z = self.merge_heads(z) # [B,k,H]
     out = self.c_proj(out)
-    return out, s, z
+    return [out, s, z]
 
   # generic forward function that auto manages which style of processing to perform
   def forward(self, x, attention_mask = None, s = None, z = None):
     if self.infer_ready:
       assert x.shape[1] == 1, f"During inference only one token is allowed got: {x.shape}"
-      output = self.rnn_forward(x, s, z)
+      output = self.rnn_forward(x, s, z) # out, s, z
     else:
-      output = self.standard_forward(x, attention_mask)
+      output = self.standard_forward(x, attention_mask) # out
     return output
-    
 
   
 class Block(nn.Module):
   def __init__(self, config):
+    """gpt2.modeling_gpt2.Block modified for use with RNNs
+
+    Args:
+      config (GPT2Config): configuration for this module
+    """
     super().__init__()
     
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.n_embd
@@ -139,14 +143,26 @@ class Block(nn.Module):
     # self.attn = gpt2.modeling_gpt2.Attention(config.n_embd, config.n_ctx, config)
     self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
     self.mlp = gpt2.modeling_gpt2.MLP(inner_dim, config)
-    
+
   def infer_init(self):
     self.attn.infer_init()
-    
-  def forward(self, hidden_states, s, z):
-    attn_outputs, s, z = self.attn(self.ln_1(hidden_states), s, z)
-    if isinstance(attn_outputs, tuple):
+
+  def forward(self, hidden_states, attention_mask = None, s = None, z = None):
+    # forward pass through attention layer and break into components based on
+    # type of method
+    attn_outputs = self.attn(
+      x = self.ln_1(hidden_states),
+      attention_mask = attention_mask,
+      s = s, z = z
+    )
+    if len(attn_outputs) == 1:
+      # this is standard transformer feedforward
       attn_outputs = attn_outputs[0]
+      s, z = None, None
+    elif len(attn_outputs) == 3:
+      # this is RNN transformer output
+      attn_outputs, s, z, = attn_outputs
+
     # NOTE: this operation is not correct and will cause errors during loss.backward()
     # hidden_states += attn_outputs
     # because "+=" causes inplace update and not create a new variable meaning that
@@ -154,128 +170,12 @@ class Block(nn.Module):
     hidden_states = hidden_states + attn_outputs
     mlp_states = self.mlp(self.ln_2(hidden_states))
     hidden_states = hidden_states +  mlp_states
+    
+    # always return these three upstream model will have to manage this
     return hidden_states, s, z
-  
-class T2RInferDecoderOnly(nn.Module):
-  def __init__(self, config):
-    """This is decoder only T2R infer module, meaning this particular class
-    is supposed to be used just like GPT would be. Note this is for inference
-    only.
+ 
 
-    Args:
-        config (GPT2Config): configuration for this module
-    """
-    super().__init__()
-
-    assert hasattr(GPT2Config, "feature_size"), "Specify feature_size in configuration" 
-    
-    self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-    self.wpe = nn.Embedding(config.n_positions, config.n_embd)
-    self.drop = nn.Dropout(config.embd_pdrop)
-    self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-    self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False)
-    
-    self.infer_ready = False # flag
-    self.infer_init()
-    
-  def infer_init(self):
-    """Prepares the model for inference by fusing parameters in RNNAttention Layer
-    """
-    print("Preparing Model for inference")
-    for block in self.h:
-      block.infer_init()
-    self.infer_ready = True
-    
-  @staticmethod
-  def top_k_logits(logits, k):
-    v, ix = torch.topk(logits, k)
-    out = logits.clone()
-    out[out < v[:, [-1]]] = -1e10
-    return out
-  
-  def forward(self, hstate, s, z):
-    for block in self.h:
-      # we don't need the outputs of the model for all these tokens only
-      # the RNN states
-      logits, s, z = block(hstate, s, z)
-    logits = self.lm_head(self.ln_f(logits))
-    return logits, s, z
-
-  # methods that handle vanilla generation
-
-  def get_next_tokens(self, logits, top_k, do_sample, num_return_sequences):
-    if top_k is not None:
-      logits = self.top_k_logits(logits, top_k)
-    probs = F.softmax(logits, dim=-1)[:, -1, :]
-
-    if do_sample:
-      ix = torch.multinomial(probs, num_samples=num_return_sequences)
-    else:
-      _, ix = torch.topk(probs, k=num_return_sequences, dim=-1)
-    
-    return ix
-     
-  @torch.no_grad()
-  def generate(
-    self,
-    input_ids,
-    max_length,
-    num_return_sequences = 1,
-    top_k = None,
-    do_sample = False
-  ):
-    assert self.infer_ready, "Not ready for inference. see `T2RInfer.infer_init()`"
-    
-    # if just a sequence, batchify
-    if len(input_ids.shape) == 1:
-      input_ids = input_ids.unsqueeze(0)
-      
-    # since the hidden states for all `num_return_sequences` will be same
-    # we first run those and then tile
-    B, S = input_ids.shape
-    
-    assert B == 1, "Only 1 sequence at a time can be generated"
-    
-    # we get position embeddings for max_length so we don't have to fetch
-    # these values again and again for each step
-    position_ids = torch.arange(0, max_length).long().unsqueeze(0)
-    position_embeds = self.wpe(position_ids)
-    inputs_embeds = self.wte(input_ids)
-
-    # go over each token in the input sequence
-    hidden_states = inputs_embeds + position_embeds[:, :S] # [B, S]
-    s, z = [0,0] # initial state is always 0
-    print(hidden_states.shape)
-    for i in range(S):
-      hstate = hidden_states[:, i].unsqueeze(1)
-      logits, s, z = self.forward(hstate, s, z)
-
-    # get the next tokens
-    ix = self.get_next_tokens(logits, top_k, do_sample, num_return_sequences)
-    generated_tokens = [ix[0]]
-
-    # tile rnn state to handle more than one sequences
-    if num_return_sequences > 1:
-      input_ids = torch.tile(input_ids, [num_return_sequences, 1])
-      s = torch.tile(s, [num_return_sequences, 1, 1])
-      z = torch.tile(z, [num_return_sequences, 1, 1])
-    
-    for i in range(S, max_length - 1, 1):
-      # for rest of the steps
-      hidden_state = self.wte(generated_tokens[-1]) + position_embeds[:, i]
-      hidden_state = hidden_state.unsqueeze(1)
-      logits, s, z = self.forward(hidden_state, s, z)
-      ix = self.get_next_tokens(logits, top_k, do_sample, num_return_sequences)
-      generated_tokens.append(ix[0])
-    
-    generated_tokens = [x.unsqueeze(-1) for x in generated_tokens]
-    generated_tokens = torch.cat(generated_tokens, dim = 1)
-    full_seq = torch.cat([input_ids, generated_tokens], dim = 1)
-    return full_seq
-
-
-class T2RTraining(nn.Module):
+class T2R(nn.Module):
   def __init__(self, config):
     """This is training only module for T2R model and behaves just like a GPT2LMHeadModel.
     You can directly load weights of any ``transformers.GPT2LMHeadModel`` ie. [`gpt`, ...].
@@ -305,8 +205,9 @@ class T2RTraining(nn.Module):
     self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False)
 
-  # methods to make life easier with huggingface
+    self.infer_ready = False
 
+  # methods to make life easier with huggingface
   @classmethod
   def from_pretrained(cls, name: str, feature_size: int):
     """load from any pretrained huggingface GPT2 model.
@@ -323,6 +224,7 @@ class T2RTraining(nn.Module):
     del base_model
     return new_class
 
+  # methods to make life easier with torch
   @property
   def num_params(self):
     return sum(p.numel() for p in self.parameters())
@@ -347,8 +249,9 @@ class T2RTraining(nn.Module):
     assert len(unexpected_keys) == 0, f"Found unexpected keys {unexpected_keys}"
 
     return "<Required Keys Matched>"
-    
-  def forward(self, input_ids, attention_mask = None, labels = None):
+
+  # functions for stansdard transformer style forward
+  def standard_forward(self, input_ids, attention_mask = None, labels = None):
     # forward works just like GPT2LMHeadModel
     B, S = input_ids.shape
     
@@ -371,7 +274,12 @@ class T2RTraining(nn.Module):
     
     # pass through blocks
     for i, block in enumerate(self.h):
-      hidden_states = block(hidden_states, attention_mask)
+      # block always returns 3 items
+      hidden_states, _, _ = block(
+        hidden_states = hidden_states,
+        attention_mask = attention_mask,
+        s = None, z = None
+      )
     
     # get final predictions
     output = self.ln_f(hidden_states)
@@ -387,11 +295,52 @@ class T2RTraining(nn.Module):
 
     return output
 
+  # functions for RNN style inference
+  def infer_init(self):
+    """Prepares the model for inference by fusing parameters in RNNAttention Layer
+    """
+    print("Preparing Model for inference")
+    for block in self.h:
+      block.infer_init()
+    self.infer_ready = True
+
+  def rnn_forward(self, x, s_rnn, z_rnn, i):
+    # x, s, z are tensors
+    # i is used for positional embedding
+    hidden_states = self.wte(x) + self.wpe.weight.data[i].unsqueeze(0)
+    # pass through blocks
+    new_s_rnn, new_z_rnn = [], []
+    for i, (block, s, z) in enumerate(zip(self.h, s_rnn, z_rnn)):
+      hidden_states, s, z = block(
+        hidden_states = hidden_states,
+        attention_mask = None,
+        s = s, z = z
+      )
+      new_s_rnn.append(s)
+      new_z_rnn.append(z)
+    output = self.ln_f(hidden_states)
+    logits = self.lm_head(output)
+
+    return logits, new_s_rnn, new_z_rnn
+
+  # auto manage which forward method to use
+  def forward(self, input_ids, attention_mask = None, labels = None, s_rnn = None, z_rnn = None, i = None):
+    """auto manage this forward pass
+    * for RNN mode: `input_ids, s_rnn, z_rnn, i` should be provided
+    * for Transformer mode: `input_ids, attention_mask, labels` should be provided
+    """
+    if self.infer_ready:
+      assert s_rnn is not None, "In RNN mode need to provide `s` for each layer"
+      assert z_rnn is not None, "In RNN mode need to provide `z` for each layer"
+      assert i is not None, "In RNN mode need to provide step number `i`"
+      output = self.rnn_forward(input_ids, s_rnn, z_rnn, i) # logits, new_s_rnn, new_z_rnn
+    else:
+      output = self.standard_forward(input_ids, attention_mask, labels) # logits, (loss)
+    return output
+
 
 if __name__ == "__main__":
-  # test RNNAttention Block
-  print("-" * 70)
-  print("Testing RNNAttention")
+  # define config that will be used throughout this test
   tinyconf = GPT2Config(
     vocab_size=38,
     n_positions=32,
@@ -401,13 +350,21 @@ if __name__ == "__main__":
     n_head=11,
     feature_size = 2
   )
-  rnn = RNNAttention(tinyconf)
 
-  assert tuple(rnn(torch.randn(1, 3, tinyconf.n_embd)).shape) == (1, 3, tinyconf.n_embd)
+  # test RNNAttention Block
+  print("-" * 70)
+  print("Testing RNNAttention")
+  
+  rnn = RNNAttention(tinyconf)
+  output = rnn(torch.randn(1, 3, tinyconf.n_embd))
+  assert len(output) == 1
+  
+  logits = output[0]
+  assert tuple(logits.shape) == (1, 3, tinyconf.n_embd)
   rnn.infer_init()
 
   s, z = 0, 0
-  for _ in range(10):
+  for _ in range(tinyconf.n_ctx):
     out, s, z = rnn(x = torch.randn(1, 1, tinyconf.n_embd), s = s, z = z)
     assert tuple(out.shape) == (1, 1, tinyconf.n_embd)
     assert tuple(s.shape) == (1, tinyconf.feature_size, tinyconf.n_embd)
@@ -415,3 +372,134 @@ if __name__ == "__main__":
     if torch.isnan(out).any():
       raise ValueError("nan found, please check")
   print("... Passed!")
+
+  # test T2R Model (Training Mode)
+  print("-" * 70)
+  print("Testing T2R Model (Training Mode)")
+  
+  t2r = T2R(tinyconf)
+  output = t2r(
+    input_ids = torch.randint(low = 0, high = tinyconf.vocab_size, size = (1, 10))
+  )
+  assert len(output) == 1
+  logits = output[0]
+  assert tuple(logits.shape) == (1, 10, tinyconf.vocab_size)
+
+  output = t2r(
+    input_ids = torch.randint(low = 0, high = tinyconf.vocab_size, size = (1, 10)),
+    labels = torch.randint(low = 0, high = tinyconf.vocab_size, size = (1, 10))
+  )
+  assert len(output) == 2
+  logits, loss = output
+  assert tuple(logits.shape) == (1, 10, tinyconf.vocab_size)
+  print("... Passed!")
+
+  # test T2R Model (Inference Mode)
+  print("-" * 70)
+  print("Testing T2R Model (Inference Mode)")
+  
+  t2r.infer_init()
+  s_rnn = [0 for _ in range(tinyconf.n_layer)]
+  z_rnn = [0 for _ in range(tinyconf.n_layer)]
+  output = t2r(
+    input_ids = torch.randint(low = 0, high = tinyconf.vocab_size, size = (1, 1)),
+    s_rnn = s_rnn, z_rnn = z_rnn, i = 0
+  )
+  assert len(output) == 3
+  logits, s_rnn, z_rnn = output
+  assert tuple(logits.shape) == (1, 1, tinyconf.vocab_size)
+  for s, z in zip(s_rnn, z_rnn):
+    # s.shape == [B,k,E] & z.shape == [B,k,H]
+    assert tuple(s.shape) == (1, tinyconf.feature_size, tinyconf.n_embd)
+    assert tuple(z.shape) == (1, tinyconf.feature_size, tinyconf.n_head)
+
+  s_rnn = [0 for _ in range(tinyconf.n_layer)]
+  z_rnn = [0 for _ in range(tinyconf.n_layer)]
+  for i in range(tinyconf.n_ctx):
+    logits, s_rnn, z_rnn = t2r(
+      input_ids = logits.argmax(-1),
+      s_rnn = s_rnn, z_rnn = z_rnn, i = i
+    )
+    if torch.isnan(logits).any():
+      raise ValueError("nan found, please check")
+  print("... Passed!")
+
+  # test Generation Mixin
+
+ 
+# class GenerationMixin():    
+#   @staticmethod
+#   def top_k_logits(logits, k):
+#     v, ix = torch.topk(logits, k)
+#     out = logits.clone()
+#     out[out < v[:, [-1]]] = -1e10
+#     return out
+
+#   def get_next_tokens(self, logits, top_k, do_sample, num_return_sequences):
+#     if top_k is not None:
+#       logits = self.top_k_logits(logits, top_k)
+#     probs = F.softmax(logits, dim=-1)[:, -1, :]
+
+#     if do_sample:
+#       ix = torch.multinomial(probs, num_samples=num_return_sequences)
+#     else:
+#       _, ix = torch.topk(probs, k=num_return_sequences, dim=-1)
+    
+#     return ix
+     
+#   @torch.no_grad()
+#   def generate(
+#     self,
+#     input_ids,
+#     max_length,
+#     num_return_sequences = 1,
+#     top_k = None,
+#     do_sample = False
+#   ):
+#     assert self.infer_ready, "Not ready for inference. see `T2RInfer.infer_init()`"
+    
+#     # if just a sequence, batchify
+#     if len(input_ids.shape) == 1:
+#       input_ids = input_ids.unsqueeze(0)
+      
+#     # since the hidden states for all `num_return_sequences` will be same
+#     # we first run those and then tile
+#     B, S = input_ids.shape
+    
+#     assert B == 1, "Only 1 sequence at a time can be generated"
+    
+#     # we get position embeddings for max_length so we don't have to fetch
+#     # these values again and again for each step
+#     position_ids = torch.arange(0, max_length).long().unsqueeze(0)
+#     position_embeds = self.wpe(position_ids)
+#     inputs_embeds = self.wte(input_ids)
+
+#     # go over each token in the input sequence
+#     hidden_states = inputs_embeds + position_embeds[:, :S] # [B, S]
+#     s, z = [0,0] # initial state is always 0
+#     for i in range(S):
+#       hstate = hidden_states[:, i].unsqueeze(1)
+#       logits, s, z = self.forward(hstate, s, z)
+
+#     # get the next tokens
+#     ix = self.get_next_tokens(logits, top_k, do_sample, num_return_sequences)
+#     generated_tokens = [ix[0]]
+
+#     # tile rnn state to handle more than one sequences
+#     if num_return_sequences > 1:
+#       input_ids = torch.tile(input_ids, [num_return_sequences, 1])
+#       s = torch.tile(s, [num_return_sequences, 1, 1])
+#       z = torch.tile(z, [num_return_sequences, 1, 1])
+    
+#     for i in range(S, max_length - 1, 1):
+#       # for rest of the steps
+#       hidden_state = self.wte(generated_tokens[-1]) + position_embeds[:, i]
+#       hidden_state = hidden_state.unsqueeze(1)
+#       logits, s, z = self.forward(hidden_state, s, z)
+#       ix = self.get_next_tokens(logits, top_k, do_sample, num_return_sequences)
+#       generated_tokens.append(ix[0])
+    
+#     generated_tokens = [x.unsqueeze(-1) for x in generated_tokens]
+#     generated_tokens = torch.cat(generated_tokens, dim = 1)
+#     full_seq = torch.cat([input_ids, generated_tokens], dim = 1)
+#     return full_seq
