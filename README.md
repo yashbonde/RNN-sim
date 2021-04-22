@@ -4,17 +4,17 @@
 
 Running large number of simulations before making a decision is the best approach to solving problems and hoes hand in had with MCTS style tree search algorithms. In this repo we explore methods that can be used in this direction.
 
-All notebooks are available in `notebooks/` folder.
+All notebooks are available in `notebooks/` folder. Check out interactive graphs on [my website]().
 
 ## Finetuning Pretrained Transformers into RNNs [arxiv](https://arxiv.org/pdf/2103.13076.pdf)
 
 Find code in folder `t2rmodel.py`. Run `$python3 t2rmodel.py` to perform tests as well. These are the results from paper:
 
-<img src="notebooks/raw_time_log.png">
+<p align="center">
+  <img src="notebooks/sample_on_website.png">
+</p>
 
 With ONNX Runtime you can generate 1024 tokens in just 0.8504s (2.5Mn Params), **Insane**! You can find all the data in `notebooks/times.json`. Infact 166 Mn parameter network generates 1024 tokens almost 3.5x faster than `model.generate(1024)` for 2.5 Mn params.
-
-<img src="notebooks/raw_time.png">
 
 # License
 
