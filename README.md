@@ -4,7 +4,7 @@
 
 Running large number of simulations before making a decision is the best approach to solving problems and hoes hand in had with MCTS style tree search algorithms. In this repo we explore methods that can be used in this direction.
 
-All notebooks are available in `notebooks/` folder. Check out interactive graphs on [my website]().
+All notebooks are available in `notebooks/` folder. Check out interactive graphs on [my website](https://yashbonde.github.io/blogs/rnn-sim.html).
 
 ## Finetuning Pretrained Transformers into RNNs [arxiv](https://arxiv.org/pdf/2103.13076.pdf)
 
