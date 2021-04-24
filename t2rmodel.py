@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from transformers.models import gpt2
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import GPT2Config, GPT2LMHeadModel, GPT2Tokenizer
 
 
 class GenerationMixin():
@@ -293,7 +293,7 @@ class T2R(nn.Module, GenerationMixin):
 
   # methods to make life easier with huggingface
   @classmethod
-  def from_pretrained(cls, name: str, feature_size: int):
+  def from_pretrained(cls, name: str, feature_size: int, return_tokenizer = False):
     """load from any pretrained huggingface GPT2 model.
 
     Args:
@@ -306,7 +306,11 @@ class T2R(nn.Module, GenerationMixin):
     new_class = cls(config)
     new_class.load_state_dict(base_model.state_dict())
     del base_model
-    return new_class
+    tokenizer = GPT2Tokenizer.from_pretrained(name)
+    if not return_tokenizer:
+      return new_class
+    else:
+      return new_class, tokenizer
 
   # methods to make life easier with torch
   @property

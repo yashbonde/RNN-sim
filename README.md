@@ -26,6 +26,11 @@ model.generate(
 )
 ```
 
+You can run the app using `streamlit`:
+```
+streamlit run t2r_app.py
+```
+
 # License
 
 GNU GENERAL PUBLIC LICENSE v3
