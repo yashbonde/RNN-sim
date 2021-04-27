@@ -383,7 +383,7 @@ class T2R(nn.Module, GenerationMixin):
       shift_logits = logits[..., :-1, :].contiguous()
       shift_labels = labels[..., 1:].contiguous()
       loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-      output = [logits, loss]
+      output = [loss, logits] # HF trainer expects loss as first item
 
     return output
 
@@ -494,7 +494,7 @@ if __name__ == "__main__":
     labels = torch.randint(low = 0, high = tinyconf.vocab_size, size = (1, 10))
   )
   assert len(output) == 2
-  logits, loss = output
+  loss, logits = output
   assert tuple(logits.shape) == (1, 10, tinyconf.vocab_size)
   print("... Passed!")
 
