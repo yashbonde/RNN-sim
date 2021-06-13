@@ -2,6 +2,7 @@
 
 <a href="https://nimblebox.ai/explore/project/pretrained-transformers-as-rnns-4168"><img src="https://img.shields.io/badge/NBXplore-Run on Nimblebox.ai-blue"></a>
 
+
 Running large number of simulations before making a decision is the best approach to solving problems and hoes hand in had with MCTS style tree search algorithms. In this repo we explore methods that can be used in this direction.
 
 All notebooks are available in `notebooks/` folder. Check out interactive graphs on [my website](https://yashbonde.github.io/blogs/rnn-sim.html).
